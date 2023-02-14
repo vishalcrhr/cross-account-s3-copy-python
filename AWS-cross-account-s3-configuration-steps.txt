@@ -1,0 +1,84 @@
+Process S3 migration.
+
+1. Created IAM user 's3migration' in destination account where data has to place with below policy.
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:ListBucket",
+                "s3:GetObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::<source-account-bucket>",
+                "arn:aws:s3:::<source-account-bucket>/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:ListBucket",
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:PutObjectAcl"
+            ],
+            "Resource": [
+                "arn:aws:s3:::<destination-account-bucket>",
+                "arn:aws:s3:::<destination-account-bucket>/*"
+            ]
+        },
+        {
+            "Sid": "s3_migration_kms_IAM",
+            "Effect": "Allow",
+            "Action": "kms:*",
+            "Resource": "*"
+        }
+    ]
+}
+
+
+====
+2. Created bucket policy in source account from where s3 data has to pick[at source bucket]
+{
+    "Version": "2012-10-17",
+    "Statement": [
+		{
+			"Sid": "DelegateS3Access",
+			"Effect": "Allow",
+			"Principal": {
+				"AWS": "arn:aws:iam::<destination-account>:user/s3migration"
+			},
+			"Action": [
+				"s3:ListBucket",
+				"s3:GetObject"
+			],
+			"Resource": [
+				"arn:aws:s3:::<source-account-bucket>/*",
+				"arn:aws:s3:::<source-account-bucket>"
+			]
+		}
+    ]
+}
+
+
+====
+3. KMS policy change which is applied to Source account bucket [mandatory step if your bucket is using any KMS encryption]
+	[Apply below policy on the specific KMS key which is being used for encryption of the bucket. This can be found at "properties" section of bucket to be transferred]
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "s3_migration_kms",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::<destination-account>:user/s3migration"
+            },
+            "Action": "kms:*",
+            "Resource": [
+				"arn:aws:s3:::<source-account-bucket>/*",
+				"arn:aws:s3:::<source-account-bucket>"
+			]
+        }
+	]
+}
