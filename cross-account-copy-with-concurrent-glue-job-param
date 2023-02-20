@@ -1,0 +1,136 @@
+import concurrent
+import io
+import time
+import sys
+from io import StringIO
+
+import pandas as pd
+
+# need to exclude 0 bytes files to transfer.
+# need to make glue job for it for seperate buckets? testing done
+# cost of cross account transfer for range of files? based on per GB
+# cost of changing the storage layer from standard to glacier.
+# tracking of files completed.
+start_time = time.time()
+print(f"""start time  {start_time}""")
+
+import boto3
+import botocore
+from awsglue.utils import getResolvedOptions
+
+client_region = boto3.Session().region_name
+
+source_bucket_name = 'name of source bucket in source aws account'
+dest_bucket_name = 'name of destination bucket in destination aws account'
+dest_folder = "temp1/check<any name of your choice>"
+prefix = "valid prefix in source bucket folder"
+
+#testparam is coming from aws cli glue job command which can be run to execute the same script for different variables like testparam usage.
+#aws glue start-job-run --job-name <GLUE_JOB_NAME_TO_BE_PUT>--arguments "{\"--testparam\":\"any_value_you_want_to_use\"}". Run this multiple time at max to  max_cocurrency of glue job
+# make sure glue job configuration of max cocurrency is set to >1.
+args = getResolvedOptions(sys.argv, ['testparam'])
+testparam = args['testparam']
+print(f""" testparam {testparam}""")
+
+# Create a boto3 session
+session = boto3.Session(
+    aws_access_key_id='xxx',
+    aws_secret_access_key='xxxxxxx',
+    region_name='eu-west-1'
+)
+
+# Connect to the S3 service
+s3_client = session.client('s3')
+
+
+def multipart_upload(src_key, processed):
+    global response
+    src_file = src_key
+    dest_object_key = src_file
+    init_result = s3_client.create_multipart_upload(Bucket=dest_bucket_name, Key=dest_object_key)
+    print(f""" src_file {src_file}""")
+    # Get the object size to track the end of the copy operation
+    metadata_result = s3_client.head_object(Bucket=source_bucket_name, Key=src_file)
+    object_size = metadata_result['ContentLength']
+    print(f""" object_size {object_size}""")
+
+    # Copy the object using 30 MB parts
+    part_size = 30 * 1024 * 1024
+    byte_position = 0
+    part_num = 1
+    etags = []
+    copy_responses = []
+    if (object_size > 0):
+        while byte_position < object_size:
+            #     # The last part might be smaller than part_size, so check to make sure that last_byte isn't beyond the end of the object
+            last_byte = min(byte_position + part_size - 1, object_size - 1)
+            #
+            #     # Copy this part
+            copy_result = s3_client.upload_part_copy(Bucket=dest_bucket_name,
+                                                     CopySource={"Bucket": source_bucket_name, "Key": src_file},
+                                                     Key=dest_object_key, UploadId=init_result['UploadId'],
+                                                     PartNumber=part_num,
+                                                     CopySourceRange=f'bytes={byte_position}-{last_byte}')
+            copy_responses.append(copy_result)
+            byte_position += part_size
+            etags.append({'ETag': copy_result['CopyPartResult']['ETag'], 'PartNumber': part_num})
+            part_num += 1
+        # Complete the upload request to concatenate all uploaded parts and make the copied object available
+        for response in etags:
+            print(f""" response{response}""")
+        output = s3_client.complete_multipart_upload(Bucket=dest_bucket_name, Key=dest_object_key,
+                                                     UploadId=init_result['UploadId'],
+                                                     MultipartUpload={"Parts": etags})
+        processed.append(src_file + "||" + init_result['UploadId'])
+        print(f"""Multipart copy complete.{src_file}""")
+    else:
+        print(f"""file is empty {src_file}""")
+
+
+try:
+
+    def retrieve_keys(bucket_name, prefix, continuation_token=None):
+        keys = []
+        kwargs = {'Bucket': bucket_name, 'Prefix': f"{prefix}"}
+        if continuation_token:
+            kwargs['ContinuationToken'] = continuation_token
+        while True:
+            response = s3_client.list_objects_v2(**kwargs)
+            keys.extend([content['Key'] for content in response.get('Contents', [])])
+            if not response.get('IsTruncated'):
+                break
+            kwargs['ContinuationToken'] = response.get('NextContinuationToken')
+        return keys
+
+
+    result = retrieve_keys(bucket_name=source_bucket_name, prefix=prefix)
+
+    processed = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
+        # Submit a task for each object in the source bucket if "Artifact_S" not in obj["Key"]
+        futures = [executor.submit(multipart_upload, obj, processed) for obj in result]
+        # Wait for all tasks to complete
+        concurrent.futures.wait(futures)
+    df = pd.DataFrame(processed)
+    if not df.empty:
+        with io.StringIO() as csv_buffer:
+            df.to_csv(csv_buffer, index=False)
+
+            response = s3_client.put_object(
+                Bucket="dataall-test-migration-bucket", Key=f"""tracking-{prefix}.csv""", Body=csv_buffer.getvalue()
+            )
+
+            status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+
+            if status == 200:
+                print(f"Successful S3 csv upload. Status - {status}")
+            else:
+                print(f"Unsuccessful S3 csv upload. Status - {status}")
+    else:
+        print("not uploaded due to some access permission of bucket")
+    end_time = time.time() - start_time
+    print(f"""end time  {end_time}""")
+
+except botocore.exceptions.ClientError as e:
+    print(f"Error: {e}")
